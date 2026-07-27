@@ -946,6 +946,13 @@ async fn rpc_getblock_missing_error() {
         .await;
     response_handler.respond(zakura_state::ReadResponse::Block(None));
 
+    // A missing body is only reported as a missing block when the node does not
+    // have the header either.
+    read_state
+        .expect_request(zakura_state::ReadRequest::BlockHeader(Height(0).into()))
+        .await
+        .respond(Err(BoxError::from("block hash or height not found")));
+
     let block_response = block_future.await.expect("block future should not panic");
     let block_response =
         block_response.expect_err("unexpected success from missing block state response");
@@ -967,6 +974,81 @@ async fn rpc_getblock_missing_error() {
     read_state.expect_no_requests().await;
 
     // The queue task should continue without errors or panics
+    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+    assert!(rpc_tx_queue_task_result.is_none());
+}
+
+/// Checks that a block whose body this node no longer stores is reported
+/// separately from a block it has never seen.
+///
+/// Pruning and checkpoint raw-transaction skipping keep the header, so the
+/// header lookup deciding this is the same one that survives pruning.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblock_pruned_body_error() {
+    let _init_guard = zakura_test::init();
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block_future = tokio::spawn(async move { rpc.get_block("0".to_string(), Some(0u8)).await });
+
+    read_state
+        .expect_request(zakura_state::ReadRequest::Block(Height(0).into()))
+        .await
+        .respond(zakura_state::ReadResponse::Block(None));
+
+    // The body is gone but the header is retained, so this block is known.
+    read_state
+        .expect_request(zakura_state::ReadRequest::BlockHeader(Height(0).into()))
+        .await
+        .respond(ReadResponse::BlockHeader {
+            header: block.header.clone(),
+            hash,
+            height: Height(0),
+            next_block_hash: None,
+        });
+
+    let block_response = block_future.await.expect("block future should not panic");
+    let block_response =
+        block_response.expect_err("unexpected success from pruned block state response");
+
+    assert_eq!(
+        block_response.code(),
+        ErrorCode::InternalError.code(),
+        "zcashd reports a pruned body as RPC_INTERNAL_ERROR, not the -8 a client retries on"
+    );
+    assert_eq!(
+        block_response.message(),
+        "Block not available (pruned data)"
+    );
+
+    mempool.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
 }

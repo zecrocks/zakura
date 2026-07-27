@@ -48,7 +48,7 @@ use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
 use jsonrpsee_proc_macros::rpc;
-use jsonrpsee_types::{ErrorCode, ErrorObject};
+use jsonrpsee_types::{ErrorCode, ErrorObject, ErrorObjectOwned};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{
@@ -948,6 +948,56 @@ where
     pub fn network(&self) -> &Network {
         &self.network
     }
+
+    /// Returns the error for a block whose body the state did not return,
+    /// distinguishing a block this node has never seen from one whose body it
+    /// no longer stores.
+    ///
+    /// Pruning and checkpoint raw-transaction skipping delete transaction data
+    /// but keep the header, so a block that is unquestionably in the best chain
+    /// can still have no servable body. Clients need to tell the two apart: an
+    /// unknown block may yet arrive, but a pruned one never will, so retrying
+    /// or switching peers is futile.
+    ///
+    /// A block that is reorged away between the body read and this lookup is
+    /// reported as not found, which is what it has become.
+    ///
+    /// The state service returns untyped errors, so a header read that fails
+    /// because the service itself is unavailable is also reported as not found.
+    /// The body read immediately before it succeeded, so that is unlikely, and
+    /// the alternative — reporting a missing block as an internal error — would
+    /// be wrong far more often.
+    async fn missing_block_body_error(&self, hash_or_height: HashOrHeight) -> ErrorObjectOwned {
+        let header = self
+            .read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await;
+
+        if matches!(header, Ok(zakura_state::ReadResponse::BlockHeader { .. })) {
+            // zcashd throws RPC_INTERNAL_ERROR here, not one of the legacy
+            // codes, so this uses the JSON-RPC internal error code directly:
+            // <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/blockchain.cpp>
+            //     if (fHavePruned && !(pblockindex->nStatus & BLOCK_HAVE_DATA) && pblockindex->nTx > 0)
+            //         throw JSONRPCError(RPC_INTERNAL_ERROR, "Block not available (pruned data)");
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                "Block not available (pruned data)",
+                None::<()>,
+            )
+        } else {
+            // Unchanged from before this distinction existed, so that
+            // `lightwalletd`'s check for -8 keeps working.
+            //
+            // Reference for the legacy error code:
+            // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
+            ErrorObject::owned(
+                server::error::LegacyCode::InvalidParameter.into(),
+                "Block not found",
+                None::<()>,
+            )
+        }
+    }
 }
 
 #[async_trait]
@@ -1275,7 +1325,7 @@ where
                     Ok(GetBlockResponse::Raw(block.into()))
                 }
                 zakura_state::ReadResponse::Block(None) => {
-                    Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
+                    Err(self.missing_block_body_error(hash_or_height).await)
                 }
                 _ => unreachable!("unmatched response to a block request"),
             }
@@ -1351,6 +1401,12 @@ where
 
             let tx_ids_response = futs.next().await.expect("`futs` should not be empty");
             let (tx, size): (Vec<_>, Option<usize>) = match tx_ids_response.map_misc_error()? {
+                // Verbosity 1 needs no pruned-body handling: pruning deletes raw
+                // transactions but keeps `hash_by_tx_loc`, so a pruned block
+                // still answers this in full. An unknown block already failed in
+                // the `get_block_header` call above, which is where
+                // `lightwalletd` gets its -8. Reaching `None` here means the
+                // block was reorged away between the two reads.
                 zakura_state::ReadResponse::TransactionIdsForBlock(tx_ids) => (
                     tx_ids
                         .ok_or_misc_error("block not found")?
@@ -1360,7 +1416,9 @@ where
                     None,
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
-                    let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
+                    let Some((block, size)) = block_and_size else {
+                        return Err(self.missing_block_body_error(hash_or_height).await);
+                    };
                     let block_time = block.header.time;
                     let transactions = block
                         .transactions
