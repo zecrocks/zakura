@@ -1053,6 +1053,118 @@ async fn rpc_getblock_pruned_body_error() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// Checks that a transaction whose block body this node no longer stores is
+/// reported separately from a transaction it has never seen.
+///
+/// Pruning keeps `tx_loc_by_hash`, so the lookup deciding this is one that
+/// survives pruning by construction: it has to, because a UTXO created in a
+/// pruned block can still be spent.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getrawtransaction_pruned_and_unknown_errors() {
+    let _init_guard = zakura_test::init();
+
+    let txid = transaction::Hash::from([1; 32]);
+    let hex_txid = txid.encode_hex::<String>();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    // A transaction that was mined and then pruned is still indexed by hash.
+    let pruned_future = {
+        let rpc = rpc.clone();
+        let hex_txid = hex_txid.clone();
+        tokio::spawn(async move { rpc.get_raw_transaction(hex_txid, Some(0u8), None).await })
+    };
+
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId([txid].into()))
+        .await
+        .respond(mempool::Response::Transactions(vec![]));
+
+    read_state
+        .expect_request(zakura_state::ReadRequest::AnyChainTransaction(txid))
+        .await
+        .respond(zakura_state::ReadResponse::AnyChainTransaction(None));
+
+    read_state
+        .expect_request(zakura_state::ReadRequest::TransactionLocation(txid))
+        .await
+        .respond(zakura_state::ReadResponse::TransactionLocation(Some(
+            zakura_state::TransactionLocation::from_index(Height(1), 0),
+        )));
+
+    let pruned_error = pruned_future
+        .await
+        .expect("transaction future should not panic")
+        .expect_err("unexpected success from pruned transaction state response");
+
+    assert_eq!(
+        pruned_error.code(),
+        ErrorCode::ServerError(-1).code(),
+        "zcashd reports an unavailable block body in getrawtransaction as RPC_MISC_ERROR"
+    );
+    assert_eq!(pruned_error.message(), "Block not available");
+
+    // A transaction this node has never seen is not indexed at all.
+    let unknown_future =
+        tokio::spawn(async move { rpc.get_raw_transaction(hex_txid, Some(0u8), None).await });
+
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId([txid].into()))
+        .await
+        .respond(mempool::Response::Transactions(vec![]));
+
+    read_state
+        .expect_request(zakura_state::ReadRequest::AnyChainTransaction(txid))
+        .await
+        .respond(zakura_state::ReadResponse::AnyChainTransaction(None));
+
+    read_state
+        .expect_request(zakura_state::ReadRequest::TransactionLocation(txid))
+        .await
+        .respond(zakura_state::ReadResponse::TransactionLocation(None));
+
+    let unknown_error = unknown_future
+        .await
+        .expect("transaction future should not panic")
+        .expect_err("unexpected success from missing transaction state response");
+
+    assert_eq!(
+        unknown_error.code(),
+        ErrorCode::ServerError(-5).code(),
+        "an unknown transaction keeps the error it had before pruned ones were split out"
+    );
+    assert_eq!(
+        unknown_error.message(),
+        "Transaction not found in mempool or best chain"
+    );
+
+    mempool.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+
+    let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
+    assert!(rpc_tx_queue_task_result.is_none());
+}
+
 /// Regression test for GHSA-x6v8-c2xp-928m — panics (aborts) before the fix.
 ///
 /// When `Depth` returns `None` (side-chain block), `get_block_header` sets

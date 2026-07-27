@@ -431,6 +431,15 @@ pub enum ReadResponse {
     /// Response to [`Request::Transaction`] with the specified transaction.
     AnyChainTransaction(Option<AnyTx>),
 
+    /// Response to [`ReadRequest::TransactionLocation`] with where the
+    /// transaction sits in the finalized chain, or `None` if it is not in the
+    /// finalized chain.
+    ///
+    /// A `Some` here alongside a [`ReadResponse::Transaction(None)`](ReadResponse::Transaction)
+    /// means the transaction was pruned: it is still indexed, but its body is
+    /// no longer stored.
+    TransactionLocation(Option<TransactionLocation>),
+
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
     /// with an list of transaction hashes in block order,
     /// or `None` if the block was not found.
@@ -647,6 +656,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
+            | ReadResponse::TransactionLocation(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

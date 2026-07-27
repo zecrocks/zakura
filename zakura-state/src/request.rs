@@ -1379,6 +1379,26 @@ pub enum ReadRequest {
     ///   otherwise.
     AnyChainTransaction(transaction::Hash),
 
+    /// Looks up where a transaction sits in the finalized chain, whether or not
+    /// its body is still stored.
+    ///
+    /// Pruning deletes raw transactions from `tx_by_loc` but keeps
+    /// `tx_loc_by_hash`, so this answers for a transaction that
+    /// [`ReadRequest::Transaction`] can no longer return. Use it to tell a
+    /// pruned transaction apart from one this node has never seen.
+    ///
+    /// Non-finalized transactions are not covered: their blocks are held in
+    /// memory in full, so a transaction missing from the non-finalized state is
+    /// genuinely absent rather than pruned.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::TransactionLocation(Some(TransactionLocation))`](ReadResponse::TransactionLocation)
+    ///   if the transaction is in the finalized chain;
+    /// * [`ReadResponse::TransactionLocation(None)`](ReadResponse::TransactionLocation)
+    ///   otherwise.
+    TransactionLocation(transaction::Hash),
+
     /// Looks up the transaction IDs for a block, using a block hash or height.
     ///
     /// Returns
@@ -1731,6 +1751,7 @@ impl ReadRequest {
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
             ReadRequest::AnyChainTransaction(_) => "any_chain_transaction",
+            ReadRequest::TransactionLocation(_) => "transaction_location",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",

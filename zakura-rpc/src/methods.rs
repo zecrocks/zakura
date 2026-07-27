@@ -967,6 +967,9 @@ where
     /// The body read immediately before it succeeded, so that is unlikely, and
     /// the alternative — reporting a missing block as an internal error — would
     /// be wrong far more often.
+    ///
+    /// See [`missing_transaction_error`](Self::missing_transaction_error) for
+    /// the same distinction on transactions.
     async fn missing_block_body_error(&self, hash_or_height: HashOrHeight) -> ErrorObjectOwned {
         let header = self
             .read_state
@@ -994,6 +997,55 @@ where
             ErrorObject::owned(
                 server::error::LegacyCode::InvalidParameter.into(),
                 "Block not found",
+                None::<()>,
+            )
+        }
+    }
+
+    /// Returns the error for a transaction the state did not return,
+    /// distinguishing one this node has never seen from one whose block body it
+    /// no longer stores.
+    ///
+    /// Pruning deletes raw transactions but keeps `tx_loc_by_hash`, which it
+    /// must: a UTXO created in an old block can be spent at any later height, so
+    /// that index has to outlive the transaction bytes. A hit there after the
+    /// transaction read came back empty therefore means the transaction was
+    /// mined and then pruned, not that it is unknown.
+    ///
+    /// Only the finalized chain can be in that state. Non-finalized blocks are
+    /// held in memory in full, so a transaction missing from them is genuinely
+    /// absent.
+    async fn missing_transaction_error(&self, txid: transaction::Hash) -> ErrorObjectOwned {
+        let location = self
+            .read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::TransactionLocation(txid))
+            .await;
+
+        if matches!(
+            location,
+            Ok(zakura_state::ReadResponse::TransactionLocation(Some(_)))
+        ) {
+            // zcashd reports a transaction whose block data it no longer has as
+            // RPC_MISC_ERROR "Block not available", which is a different code
+            // and message from the pruned case in `getblock`:
+            // <https://github.com/zcash/zcash/blob/v6.3.0/src/rpc/rawtransaction.cpp>
+            //     if (!(blockindex->nStatus & BLOCK_HAVE_DATA)) {
+            //         throw JSONRPCError(RPC_MISC_ERROR, "Block not available");
+            //     }
+            ErrorObject::owned(
+                server::error::LegacyCode::Misc.into(),
+                "Block not available",
+                None::<()>,
+            )
+        } else {
+            // Unchanged from before this distinction existed.
+            //
+            // Reference for the legacy error code:
+            // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L544>
+            ErrorObject::owned(
+                server::error::LegacyCode::InvalidAddressOrKey.into(),
+                "Transaction not found in mempool or best chain",
                 None::<()>,
             )
         }
@@ -1979,8 +2031,7 @@ where
             }),
 
             zakura_state::ReadResponse::AnyChainTransaction(None) => {
-                Err("Transaction not found in mempool or best chain")
-                    .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                Err(self.missing_transaction_error(txid).await)
             }
 
             _ => unreachable!("unmatched response to a `Transaction` read request"),

@@ -1917,6 +1917,13 @@ impl Service<ReadRequest> for ReadStateService {
                 read::mined_transaction(state.latest_best_chain(), &state.db, hash),
             )),
 
+            // Used by the `getrawtransaction` RPC to tell a pruned transaction
+            // apart from an unknown one. Only the finalized chain keeps an index
+            // without a body; non-finalized blocks are held in memory in full.
+            ReadRequest::TransactionLocation(hash) => Ok(ReadResponse::TransactionLocation(
+                state.db.transaction_location(hash),
+            )),
+
             ReadRequest::AnyChainTransaction(hash) => {
                 Ok(ReadResponse::AnyChainTransaction(read::any_transaction(
                     state.latest_non_finalized_state().chain_iter(),

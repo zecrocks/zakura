@@ -354,9 +354,20 @@ proptest! {
                 .expect_request(mempool::Request::TransactionsByMinedId([unknown_txid].into()))
                 .map_ok(|r| r.respond(mempool::Response::Transactions(vec![])));
 
-            let state_query = state
-                .expect_request(zakura_state::ReadRequest::AnyChainTransaction(unknown_txid))
-                .map_ok(|r| r.respond(zakura_state::ReadResponse::AnyChainTransaction(None)));
+            // A transaction that is in neither the mempool nor any chain is then
+            // checked against the finalized transaction index, which separates a
+            // pruned transaction from an unknown one.
+            let state_query = async {
+                state
+                    .expect_request(zakura_state::ReadRequest::AnyChainTransaction(unknown_txid))
+                    .map_ok(|r| r.respond(zakura_state::ReadResponse::AnyChainTransaction(None)))
+                    .await?;
+
+                state
+                    .expect_request(zakura_state::ReadRequest::TransactionLocation(unknown_txid))
+                    .map_ok(|r| r.respond(zakura_state::ReadResponse::TransactionLocation(None)))
+                    .await
+            };
 
             let rpc_query = rpc.get_raw_transaction(unknown_txid.encode_hex(), Some(1), None);
 

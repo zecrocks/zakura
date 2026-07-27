@@ -1096,6 +1096,25 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
         Some(Height(4)),
         "lowest retained height advanced to the exclusive prune bound"
     );
+
+    // A pruned transaction stays indexed even though its body is gone, which is
+    // what lets `getrawtransaction` tell it apart from an unknown transaction.
+    for height in 1..4 {
+        let tx_hash = coinbase_tx_hash(&network, height);
+
+        assert!(
+            state.db.transaction(tx_hash).is_none(),
+            "raw transaction is pruned at height {height}"
+        );
+        assert_eq!(
+            state
+                .db
+                .transaction_location(tx_hash)
+                .map(|location| location.height),
+            Some(Height(height)),
+            "pruned transaction at height {height} is still located by hash"
+        );
+    }
 }
 
 #[test]
